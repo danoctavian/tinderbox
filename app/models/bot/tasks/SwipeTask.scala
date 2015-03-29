@@ -10,6 +10,7 @@ import scala.concurrent.ExecutionContext.Implicits._
 import java.util.Date
 import utils.tinder.TinderApi
 import utils.tinder.model._
+import models.bot.logic.{LikeAction, Liker}
 
 /**
  * Worker task that processes recommendations.
@@ -46,6 +47,7 @@ class SwipeTask(val xAuthToken: String, val tinderBot: ActorRef, val rec: Recomm
           Logger.debug("[tinderbot] User was disliked because: "+reason)
       }
     }
+    user.user
   }
 
   private def likeUser(reason: String) = {
@@ -81,22 +83,12 @@ class SwipeTask(val xAuthToken: String, val tinderBot: ActorRef, val rec: Recomm
     Logger.info("[tinderbot] Ignored recommended user "+rec._id)
   }
 
-  private def photoCriteria(photos: List[Photo]): Boolean = {
-    val facesPerPhoto: List[Int] = photos.map { photo =>
-      FacialDetection(photo.url).countFaces
-    }
 
-    Logger.debug("[tinderbot] Number of faces for user %s: %s".format(rec._id, facesPerPhoto.toString))
-
-    if(facesPerPhoto.find(p => p==1) == None) false // no singular photo of themselves
-    else if(facesPerPhoto.sum==0) false // can't find a face in any photo
-    else true
-  }
 
   def receive = {
     case "tick" =>
       // some initial criteria
-      val day = 86400000L
+
       val lastSeenAgo = {
         val now = System.currentTimeMillis
         val lastSeen = tinderApi.ISO8601.parse(rec.ping_time).getTime
@@ -107,20 +99,14 @@ class SwipeTask(val xAuthToken: String, val tinderBot: ActorRef, val rec: Recomm
       Here we assess a recommended user. The strategy is to eliminate users who
       don't meet certain criteria.
        */
-      if(rec.photos.size==2 && rec.bio=="") dislikeUser("sparse photos, no bio")
-      else if (rec.photos.size==1) dislikeUser("sparse photos")
-      else if (lastSeenAgo > (day*3)) dislikeUser("hasn't been active for %s days".format((lastSeenAgo/day)))
-      else if (!photoCriteria(rec.photos)) dislikeUser("failed photo criteria")
-      else if (rec.bio.matches("no.{0,15}hookups")) likeUser("claiming friendship only")
-      else if (autoLike) likeUser("auto-liked")
-      else {
-        recommendation.FacialRecommendation.makeComparison(user.user._id, rec._id, rec.photos) match {
-          case Some(true) => likeUser("face matched positive recommendation criteria")
-          case Some(false) => dislikeUser("face did not match recommendation criteria")
-          case None => ignoreUser("not enough data for decision")
-        }
-      }
 
+      val outcome = Liker.mvpLike(rec, lastSeenAgo) //, autoLike, user.user._id)
+
+      outcome._1 match {
+        case LikeAction.Like => likeUser(outcome._2)
+        case LikeAction.Dislike => dislikeUser(outcome._2)
+        case LikeAction.Ignore => ignoreUser(outcome._2)
+      }
 
       // make sure we properly shut down this actor
       self ! PoisonPill
